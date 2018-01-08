@@ -7,6 +7,9 @@ import threading
 import socketserver
 import struct
 import ipaddress
+import psycopg2
+
+import password
 
 HOST, PORT = "0.0.0.0", 15432
 
@@ -14,9 +17,41 @@ HOST, PORT = "0.0.0.0", 15432
 def dbg(m):
     print(m)
 
+
+db_host=password.db_host
+db_name=password.db_name
+db_user=password.db_user
+db_passwd=password.db_passwd
+   
+def dbconn():
+    return 'host=%s dbname=%s user=%s password=%s' % (db_host, db_name, db_user, db_passwd)
+
+
+def dbselect(select):
+    conn = psycopg2.connect(dbconn())
+    cur = conn.cursor()
+    cur.execute(select)
+    for r in cur:
+        yield r
+
+    cur.close()
+    conn.close()
+
+def dbexec(statement):
+    conn = psycopg2.connect(dbconn())
+    cur = conn.cursor()
+    cur.execute(statement)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+
+
 class RTRDatabase(object):
     def __init__(self):
         self.last_serial = 0
+        self.connected_routers = set()
 
     def get_serial(self):
         return self.last_serial
@@ -26,6 +61,7 @@ class RTRDatabase(object):
 
     def get_announcements4(self, serial=0):
         if serial > self.last_serial:
+            #return dbselect("select asn, prefix, max_length from payload_roas where filtered = false and family(prefix) = 4;")
             return [(29134, '217.31.48.0/20', 20), (29134, '62.109.128.0/19', 19)]
         else:
             return []
@@ -38,6 +74,24 @@ class RTRDatabase(object):
 
     def get_withdrawals6(self, serial=0):
         return []
+
+    def connected(self, host):
+        print("Connected from %s" % host)
+        self.connected_routers.add(host)
+        dbexec("insert into rtr_status_entries (router, state) values ('%s', 1);" % host)
+
+    def disconnected(self, host=None):
+        def dbdis(host):
+            dbexec("insert into rtr_status_entries (router, state) values ('%s', 0);" % host)
+
+        dbg("Disconnected %s" % str(host))
+        if host:
+            dbdis(host)
+            self.connected_routers.remove(host)
+        else:
+            for h in self.connected_routers:
+                dbdis(h)
+            self.connected_routers = set()
 
 
 
@@ -55,10 +109,11 @@ class RTRConnHandler(socketserver.BaseRequestHandler):
         self.serial = 1024
 
         dbg("New connection from: %s " % str(self.client_address))
+        self.server.db.connected(self.client_address[0])
         # TODO: register for notifies
 
     def finish(self):
-        pass
+        self.server.db.disconnected(self.client_address[0])
         # TODO: de-register
 
     HEADER_LEN = 8
@@ -188,29 +243,36 @@ class RTRConnHandler(socketserver.BaseRequestHandler):
  
 
     def handle(self):
-        while True:
-            b = self.request.recv(self.HEADER_LEN, socket.MSG_WAITALL)
-            proto_ver, pdu_type, sess_id, length = self.decode_header(b)
-            dbg(">Header proto_ver=%d pdu_type=%d sess_id=%d length=%d" % (proto_ver, pdu_type, sess_id, length))
+        try:
+            while True:
+                b = self.request.recv(self.HEADER_LEN, socket.MSG_WAITALL)
+                proto_ver, pdu_type, sess_id, length = self.decode_header(b)
+                dbg(">Header proto_ver=%d pdu_type=%d sess_id=%d length=%d" % (proto_ver, pdu_type, sess_id, length))
 
-            if pdu_type == self.SERIAL_QUERY_TYPE:
-                b = self.request.recv(self.SERIAL_QUERY_LEN - self.HEADER_LEN,
+                if pdu_type == self.SERIAL_QUERY_TYPE:
+                    b = self.request.recv(self.SERIAL_QUERY_LEN - self.HEADER_LEN,
                         socket.MSG_WAITALL)
-                self.handle_serial_query(b)
+                    self.handle_serial_query(b)
 
-            elif pdu_type == self.RESET_TYPE:
-                self.handle_reset()
+                elif pdu_type == self.RESET_TYPE:
+                    self.handle_reset()
 
-            elif pdu_type == self.ERROR_TYPE:
-                b = self.request.recv(length - self.HEADER_LEN, socket.MSG_WAITALL)
-                self.handle_error(b)
+                elif pdu_type == self.ERROR_TYPE:
+                    b = self.request.recv(length - self.HEADER_LEN, socket.MSG_WAITALL)
+                    self.handle_error(b)
+        except:
+            pass
 
 
 
 def main():
     db = RTRDatabase()
     server = ThreadedTCPServer((HOST, PORT), RTRConnHandler, db)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        db.disconnected()
+        raise
 
 if __name__ == "__main__":
     main()
