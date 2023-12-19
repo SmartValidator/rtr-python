@@ -152,6 +152,7 @@ class RTRConnHandler(socketserver.BaseRequestHandler):
     def handle_serial_query(self, buf):
         serial = struct.unpack('!I', buf)[0]
         dbg(">Serial query: %d" % serial)
+        self.server.db.set_serial(0)
         self.send_cacheresponse()
 
         for asn, ipnet, maxlen in self.server.db.get_announcements4(serial):
